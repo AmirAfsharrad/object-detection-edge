@@ -1,0 +1,8 @@
+Model:
+  cfg_path: model_files/yolov3-tiny.cfg
+  names_path: model_files/coco.names
+  weights_path: model_files/yolov3-tiny.weights
+  img-size: 320
+  conf-thres: 0.2
+  iou-thres: 0.2
+  augment: True
