@@ -222,12 +222,20 @@ class YOLOLayer(nn.Module):
             return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
 
 
+class MyReturn():
+    def __init__(self, x, yolo_out, out):
+        self.x = x
+        self.yolo_out = yolo_out
+        self.out = out
+
+
 class Darknet(nn.Module):
     # YOLOv3 object detection model
 
-    def __init__(self, cfg, img_size=(416, 416), verbose=False):
+    def __init__(self, cfg, cut, img_size=(416, 416), verbose=False, ):
         super(Darknet, self).__init__()
-
+        self.out = []
+        self.yolo_out = []
         self.module_defs = parse_model_cfg(cfg)
         self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg)
         self.yolo_layers = get_yolo_layers(self)
@@ -237,6 +245,7 @@ class Darknet(nn.Module):
         self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
         self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
         self.info(verbose) if not ONNX_EXPORT else None  # print model description
+        self.is_in_last_part = cut
 
     def forward(self, x, augment=False, verbose=False):
 
@@ -269,46 +278,53 @@ class Darknet(nn.Module):
             return y, None
 
     def forward_once(self, x, augment=False, verbose=False):
-        img_size = x.shape[-2:]  # height, width
-        yolo_out, out = [], []
-        if verbose:
-            print('0', x.shape)
-            str = ''
+        if not self.is_in_last_part:
+            img_size = x.shape[-2:]  # height, width
+            # self.yolo_out, self.out = [], []
+            if verbose:
+                str = ''
 
-        # Augment images (inference and test only)
-        if augment:  # https://github.com/ultralytics/yolov3/issues/931
-            nb = x.shape[0]  # batch size
-            s = [0.83, 0.67]  # scales
-            x = torch.cat((x,
-                           torch_utils.scale_img(x.flip(3), s[0]),  # flip-lr and scale
-                           torch_utils.scale_img(x, s[1]),  # scale
-                           ), 0)
+            # Augment images (inference and test only)
+            if augment:  # https://github.com/ultralytics/yolov3/issues/931
+                nb = x.shape[0]  # batch size
+                s = [0.83, 0.67]  # scales
+                x = torch.cat((x,
+                               torch_utils.scale_img(x.flip(3), s[0]),  # flip-lr and scale
+                               torch_utils.scale_img(x, s[1]),  # scale
+                               ), 0)
+
 
         for i, module in enumerate(self.module_list):
+            if not self.is_in_last_part and i == 5:
+                return x, self.out, self.yolo_out
+
+            if self.is_in_last_part and i < 5:
+                continue
             name = module.__class__.__name__
             if name in ['WeightedFeatureFusion', 'FeatureConcat']:  # sum, concat
                 if verbose:
                     l = [i - 1] + module.layers  # layers
-                    sh = [list(x.shape)] + [list(out[i].shape) for i in module.layers]  # shapes
+                    sh = [list(x.shape)] + [list(self.out[i].shape) for i in module.layers]  # shapes
                     str = ' >> ' + ' + '.join(['layer %g %s' % x for x in zip(l, sh)])
-                x = module(x, out)  # WeightedFeatureFusion(), FeatureConcat()
+                x = module(x, self.out)  # WeightedFeatureFusion(), FeatureConcat()
             elif name == 'YOLOLayer':
-                yolo_out.append(module(x, out))
+                self.yolo_out.append(module(x, self.out))
             else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
+
                 x = module(x)
 
-            out.append(x if self.routs[i] else [])
+            self.out.append(x if self.routs[i] else [])
             if verbose:
-                print('%g/%g %s -' % (i, len(self.module_list), name), list(x.shape), str)
+                print('%g/%g %qs -' % (i, len(self.module_list), name), list(x.shape), str)
                 str = ''
 
         if self.training:  # train
-            return yolo_out
+            return self.yolo_out
         elif ONNX_EXPORT:  # export
-            x = [torch.cat(x, 0) for x in zip(*yolo_out)]
+            x = [torch.cat(x, 0) for x in zip(*self.yolo_out)]
             return x[0], torch.cat(x[1:3], 1)  # scores, boxes: 3780x80, 3780x4
         else:  # inference or test
-            x, p = zip(*yolo_out)  # inference output, training output
+            x, p = zip(*self.yolo_out)  # inference output, training output
             x = torch.cat(x, 1)  # cat yolo outputs
             if augment:  # de-augment results
                 x = torch.split(x, nb, dim=0)
